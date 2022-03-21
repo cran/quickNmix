@@ -1,5 +1,6 @@
-#' @title Fit Asymptotic N-mixture Model
+#' @title Fit Asymptotic N-mixture Model Using optimParallel
 #' @description Fit an open population N-mixture model using the asymptotic approximation. The four parameters are mean initial site abundance lambda, mean recruitments gamma, survival probability omega, and probability of detection pdet. Parameters can be made to vary over sites and over times by including parameter covariates. Note that this function is essentially a wrapper for optim acting on the nll function.
+#' @param cluster cluster object created using makeCluster, for example: `cl <- makeCluster(parallel::detectCores()-1)`
 #' @param nit Matrix of counts data. Rows represent sites, columns represent sampling occasions. Note that if the data is a vector, then it will be converted to a matrix with a single row.
 #' @param K Upper bound on summations in the likelihood function. K should be chosen large enough that the negative log likelihood function is stable (unchanging as K increases). If K=NULL, K=5*max(nit) will be used as default. Default: NULL
 #' @param starts Either NULL for default starting values, or a vector of parameter values: `c(log(lambda), log(gamma), logit(omega), logit(pdet))`. Note that the parameter vector will need to be longer by one for each parameter coefficient if covariate values are supplied. The order of coefficients is: `c(lambda, l_s_c, gamma, g_s_c, g_t_c, omega, o_s_c, o_t_c, pdet, p_s_c, p_t_c)`
@@ -13,22 +14,33 @@
 #' @param SMALL_a_CORRECTION If TRUE will apply the small a correction when calculating the transition probability matrix, Default: FALSE
 #' @param VERBOSE If TRUE, will print additional information during model fitting, Default: FALSE
 #' @param outfile Location of csv file to write/append parameter values, can be used to checkpoint long running model fits. Default: NULL
-#' @param method Optimization method, passed to optim function, options include: "BFGS", "Nelder-Mead", "CG". Default: "BFGS"
-#' @param ... Additional arguments passed to the optimization function optim. For example: `control = list(trace=1, REPORT=1, reltol=1e-10)`
+#' @param LowerBounds Lower bounds to be passed to optimParallel (if NULL, default values will be used), you may need to set this manually if you receive errors such as: "L-BFGS-B needs finite values of 'fn'".
+#' @param ... Additional arguments passed to the optimization function optimParallel.
 #' @return Returns the fitted model object.
 #' @examples 
 #' if (interactive()) {
-#' nit = matrix(c(1,1,0,1,1), nrow=1) # observations for 1 site, 5 sampling occassions
-#' model1 = fitNmix(nit, K=2)        # fit the model with population upper bound K=2
+#' cl <- makeCluster(parallel::detectCores()-1) # number of clusters should be 2*p+1 for optimal gains
+#' nit = matrix(c(1,1,0,1,1,2,2), nrow=1) # observations for 1 site, 7 sampling occassions
+#' model1 = fitNmixPara(cl, nit, K=100) # fit the model with population upper bound K=100
+#' parallel::stopCluster(cl)
 #' }
+#' @import doParallel
 #' @importFrom stats optim plogis
-#' @rdname fitNmix
+
+#' @rdname fitNmixPara
 #' @export 
-fitNmix <- function(nit, K=NULL, starts=NULL, l_s_c=NULL, g_s_c=NULL, g_t_c=NULL, o_s_c=NULL, o_t_c=NULL, p_s_c=NULL, p_t_c=NULL, SMALL_a_CORRECTION=FALSE, VERBOSE=FALSE, outfile=NULL, method = "BFGS", ...) {
+fitNmixPara <- function(cluster, nit, K=NULL, starts=NULL, l_s_c=NULL, g_s_c=NULL, g_t_c=NULL, o_s_c=NULL, o_t_c=NULL, p_s_c=NULL, p_t_c=NULL, SMALL_a_CORRECTION=FALSE, VERBOSE=FALSE, outfile=NULL, LowerBounds=NULL,...) {
   if(is.null(nrow(nit))) {
     warning("WARNING: converting vector nit to a matrix with one row.")
     nit = matrix(nit, nrow=1)
   }
+  parallel::clusterExport(cluster, "log_tp_MAT_lse", envir=environment())
+  parallel::clusterExport(cluster, "%dopar%", envir=environment())
+  parallel::clusterExport(cluster, "Pab_asymptotic", envir=environment())
+  parallel::clusterExport(cluster, "Pab_gamma", envir=environment())
+  parallel::clusterExport(cluster, "logSubtractExp", envir=environment())
+  parallel::clusterExport(cluster, "Ax_log", envir=environment())
+  parallel::clusterExport(cluster, "logSumExp", envir=environment())
   
   lamb_starts <- c(1)
   gamm_starts <- c(1)
@@ -121,6 +133,14 @@ fitNmix <- function(nit, K=NULL, starts=NULL, l_s_c=NULL, g_s_c=NULL, g_t_c=NULL
     starts <- c(lamb_starts, gamm_starts, omeg_starts, pdet_starts)
   }
   
+  
+  if(is.null(LowerBounds)) {
+    LowerBounds = c(0, rep(-1e6,length(lamb_starts)-1),
+                    -1e1, rep(-1e6,length(gamm_starts)-1),
+                    -1e6, rep(-1e6,length(omeg_starts)-1),
+                    -1e6, rep(-1e6,length(pdet_starts)-1))
+  }
+  
   NAMES <- c(lamb_names, gamm_names, omeg_names, pdet_names)
   
   if(length(NAMES) != length(starts)) {
@@ -131,23 +151,23 @@ fitNmix <- function(nit, K=NULL, starts=NULL, l_s_c=NULL, g_s_c=NULL, g_t_c=NULL
     K = 5*max(nit)
   }
   
-  opt = optim(par = starts,
-              fn  = nll, 
-              nit = nit,
-              K   = K, 
-              l_s_c = l_s_c, 
-              g_s_c = g_s_c, 
-              g_t_c = g_t_c, 
-              o_s_c = o_s_c, 
-              o_t_c = o_t_c, 
-              p_s_c = p_s_c, 
-              p_t_c = p_t_c, 
-              SMALL_a_CORRECTION = SMALL_a_CORRECTION, 
-              VERBOSE = VERBOSE, 
-              outfile = outfile,
-              method  = method,
-              hessian = F,
-              ...     = ...)
+  opt = optimParallel::optimParallel(par = starts,
+                                     fn  = nll, 
+                                     nit = nit,
+                                     K   = K, 
+                                     l_s_c = l_s_c, 
+                                     g_s_c = g_s_c, 
+                                     g_t_c = g_t_c, 
+                                     o_s_c = o_s_c, 
+                                     o_t_c = o_t_c, 
+                                     p_s_c = p_s_c, 
+                                     p_t_c = p_t_c, 
+                                     SMALL_a_CORRECTION = SMALL_a_CORRECTION, 
+                                     VERBOSE = VERBOSE, 
+                                     outfile = outfile, 
+                                     lower = LowerBounds, 
+                                     parallel = list(cl=cluster),
+                                     ...)
   
   names(opt$par) <- NAMES
   model_data = list(K = K, 
@@ -226,7 +246,7 @@ fitNmix <- function(nit, K=NULL, starts=NULL, l_s_c=NULL, g_s_c=NULL, g_t_c=NULL
   for(row in 1:nrow(nit)) {
     lambdaM[row,1] = exp(sum(B_l * lamb[row,]))
   }
-
+  
   gammaM = matrix(0, nrow=nrow(nit), ncol=ncol(nit))
   for(row in 1:nrow(nit)) {
     for(col in 1:ncol(nit)) {
